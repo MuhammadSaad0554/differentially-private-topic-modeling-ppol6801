@@ -1,0 +1,544 @@
+---
+title: "Differential Privacy for LDA Topic Modeling"
+author: "Muhammad Saad"
+date: "2025-12-07"
+
+format:
+  html:
+    toc: true
+    toc_float: true
+    code-fold: true
+
+execute:
+  warning: false
+  message: false
+---
+
+check whether files exist
+
+```{r}
+exists("dfm_small")
+exists("lda_model")
+exists("dfm_removed_small")
+exists("lda_removed")
+```
+
+save all files from the 01_LDA_Privacy.rmd file
+
+```{r}
+save(
+  dfm_small, lda_model,
+  dfm_removed_small, lda_removed,
+  file = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/data/lda_objects.RData"
+)
+```
+
+load the preprocessed lda dataset 
+
+```{r}
+load("/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/data/lda_objects.RData")
+```
+
+Extract word-topic counts 
+
+```{r}
+library(tidyverse)
+library(topicmodels)
+
+theta <- lda_model@gamma            # document-topic matrix
+phi   <- exp(lda_model@beta)        # topic-word matrix on probability scale
+
+# Correct vocabulary assignment
+vocab_lda <- lda_model@terms
+colnames(phi) <- vocab_lda
+
+dim(theta)
+dim(phi)
+```
+
+Align dfm to the LDA vocabulary
+
+```{r}
+dfm_aligned <- dfm_small[, vocab_lda]
+
+# Convert to dtm for coherence computation
+dtm <- as(dfm_aligned, "dgCMatrix")
+
+# Compute coherence before DP once 
+library(textmineR)
+coh_before <- CalcProbCoherence(phi, dtm)
+```
+
+
+define laplace noise generator
+
+```{r}
+# Laplace noise generator (no packages needed)
+rlaplace <- function(n, location = 0, scale = 1) {
+  u <- runif(n, -0.5, 0.5)
+  location - scale * sign(u) * log(1 - 2 * abs(u))
+}
+
+# Function to add Laplace noise to a matrix
+add_laplace <- function(x, eps = 1, sens = 1) {
+  b <- sens / eps
+  noise <- rlaplace(length(x), location = 0, scale = b)
+  matrix(x + noise, nrow = nrow(x), ncol = ncol(x))
+}
+```
+
+convert phi probabilities into pseudo counts
+
+```{r}
+scale_factor <- 100
+phi_counts <- round(phi * scale_factor)
+```
+
+```{r}
+epsilon <- 1
+phi_noisy <- add_laplace(phi_counts, eps = epsilon, sens = 1)
+phi_noisy[phi_noisy < 0] <- 0
+```
+
+Normalize the noisy counts 
+
+```{r}
+phi_dp <- phi_noisy / rowSums(phi_noisy)
+colnames(phi_dp) <- vocab_lda  
+dim(phi_dp)
+summary(rowSums(phi_dp))
+```
+
+extract top 10 words per topic before and after noise addition 
+
+```{r}
+library(tidyverse)
+
+get_top_terms <- function(phi_matrix, vocab, topic, n = 10) {
+  # phi_matrix: topic-word matrix (rows=topics)
+  # vocab: vocabulary vector extracted from dfm
+  scores <- phi_matrix[topic, ]
+  top_idx <- order(scores, decreasing = TRUE)[1:n]
+  tibble(
+    rank = 1:n,
+    term = vocab[top_idx],
+    probability = scores[top_idx]
+  )
+}
+```
+
+load vocabulary 
+
+```{r}
+vocab <- vocab_lda
+length(vocab)
+head(vocab)
+```
+
+
+extract top 10 words across topics before and after noise addition
+
+```{r}
+top_before <- get_top_terms(phi, vocab, topic = 1, n = 10)
+top_after  <- get_top_terms(phi_dp, vocab, topic = 1, n = 10)
+
+bind_cols(
+  top_before %>% rename(term_before = term, prob_before = probability),
+  top_after  %>% rename(term_after  = term, prob_after  = probability)
+)
+```
+
+get top terms
+
+```{r}
+get_top_terms <- function(phi_matrix, vocab, topic, n = 10) {
+  scores <- phi_matrix[topic, ]              # numeric vector length = vocab size
+  top_idx <- order(scores, decreasing = TRUE)[1:n]
+  tibble(
+    rank = 1:n,
+    term = vocab[top_idx],                  # this now works because vocab is correct
+    probability = scores[top_idx]
+  )
+}
+```
+
+Generate top 10 words for all 20 topics 
+
+```{r}
+top_terms_all <- lapply(1:nrow(phi), function(topic_id) {
+  before <- get_top_terms(phi, vocab, topic = topic_id, n = 10)
+  after  <- get_top_terms(phi_dp, vocab, topic = topic_id, n = 10)
+  
+  tibble(
+    topic = topic_id,
+    rank = before$rank,
+    term_before = before$term,
+    prob_before = before$probability,
+    term_after = after$term,
+    prob_after = after$probability
+  )
+})
+
+top_terms_all <- bind_rows(top_terms_all)
+```
+
+View topic 1
+
+```{r}
+top_terms_all %>% filter(topic == 1)
+```
+
+check colnames on phi from the lda
+
+```{r}
+length(colnames(phi))
+head(colnames(phi))
+```
+
+compute topic coherence before and after DP 
+
+```{r}
+library(textmineR)
+
+# Compute coherence
+
+coh_before <- CalcProbCoherence(phi, dtm)
+coh_after  <- CalcProbCoherence(phi_dp, dtm)
+
+# Compare coherence before and after DP noise
+
+coherence_comparison <- tibble(
+topic = 1:nrow(phi),
+coherence_before = coh_before,
+coherence_after  = coh_after,
+drop = coh_before - coh_after
+)
+
+coherence_comparison
+```
+
+plot the coherence drop 
+
+```{r}
+library(ggplot2)
+
+ggplot(coherence_comparison, aes(x = factor(topic), y = drop)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Topic Coherence Change After Differential Privacy (ε = 1)",
+    x = "Topic",
+    y = "Coherence Drop"
+  ) +
+  theme_minimal()
+```
+
+
+specify function to compute across multiple epsilons 
+
+```{r}
+compute_dp_coherence <- function(phi, dfm, eps, scale_factor = 100, sens = 1, seed = 1234) {
+  
+  # Fix randomness for reproducibility
+  set.seed(seed + round(eps * 1000)) 
+  
+  # Align dfm vocabulary 
+  vocab_lda <- colnames(phi)                 
+  dfm_aligned <- dfm[, vocab_lda]
+  dtm <- as(dfm_aligned, "dgCMatrix")
+  
+  # Convert phi to pseudo-counts
+  phi_counts <- round(phi * scale_factor)
+  
+  # Add Laplace noise
+  b <- sens / eps
+  noise <- rlaplace(length(phi_counts), scale = b)
+  phi_noisy <- phi_counts + matrix(noise, nrow(phi), ncol(phi))
+  phi_noisy[phi_noisy < 0] <- 0
+  
+  # Normalize
+  phi_dp <- phi_noisy / rowSums(phi_noisy)
+
+  # assign vocabulary to noisy phi
+  colnames(phi_dp) <- vocab_lda
+  
+  # Compute coherence
+  coh_before <- CalcProbCoherence(phi, dtm)
+  coh_after  <- CalcProbCoherence(phi_dp, dtm)
+  
+  tibble(
+    topic = 1:nrow(phi),
+    coherence_before = coh_before,
+    coherence_after  = coh_after,
+    drop = coh_before - coh_after,
+    epsilon = eps
+  )
+}
+```
+
+specify epsilon values
+
+```{r}
+eps_values <- c(8, 7, 6, 5, 3, 2, 1, 0.5, 0.1, 0.05)
+
+results <- lapply(eps_values, function(eps) {
+  compute_dp_coherence(phi, dfm_small, eps)
+})
+
+results <- bind_rows(results)
+```
+
+Plot the privacy-utility curve 
+
+```{r}
+privacy_curve_plot <- results %>%
+  group_by(epsilon) %>%
+  summarise(mean_drop = mean(drop)) %>%
+  ggplot(aes(x = epsilon, y = mean_drop)) +
+  geom_line(linewidth = 1.2, color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  scale_x_reverse() +
+  labs(
+    title = "Privacy–Utility Curve for DP-LDA, Sensitivity = 1",
+    x = "Epsilon (Privacy Level, lower = more privacy/noise)",
+    y = "Mean Coherence Drop"
+  ) +
+  theme_minimal()
+```
+
+save image
+
+```{r}
+ggsave(
+  filename = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures/fig4_privacy_utility_curve.png",
+  plot = privacy_curve_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+helper function to generate noisy phi and extract top terms 
+
+```{r}
+get_top_terms_for_epsilon <- function(phi, dfm, eps, scale_factor = 100, sens = 1, seed = 1234) {
+  
+  set.seed(seed + round(eps * 1000))
+  
+  # Align dfm
+  vocab_lda <- colnames(phi)
+  dfm_aligned <- dfm[, vocab_lda]
+  
+  # Convert to counts
+  phi_counts <- round(phi * scale_factor)
+  
+  # Add DP noise
+  b <- sens / eps
+  noise <- rlaplace(length(phi_counts), scale = b)
+  phi_noisy <- phi_counts + matrix(noise, nrow(phi), ncol(phi))
+  phi_noisy[phi_noisy < 0] <- 0
+  
+  # Normalize
+  phi_dp <- phi_noisy / rowSums(phi_noisy)
+  colnames(phi_dp) <- vocab_lda
+  
+  # Extract top 10 words per topic
+  top_terms <- lapply(1:nrow(phi_dp), function(topic_id) {
+    scores <- phi_dp[topic_id, ]
+    top_idx <- order(scores, decreasing = TRUE)[1:10]
+    tibble(
+      epsilon = eps,
+      topic   = topic_id,
+      rank    = 1:10,
+      term    = vocab_lda[top_idx],
+      prob    = scores[top_idx]
+    )
+  })
+  
+  bind_rows(top_terms)
+}
+```
+
+Run for three epsilons 
+
+```{r}
+eps_list <- c(5, 0.05)
+
+top_terms_all_eps <- lapply(eps_list, function(e) {
+  get_top_terms_for_epsilon(phi, dfm_small, eps = e)
+})
+
+top_terms_all_eps <- bind_rows(top_terms_all_eps)
+```
+
+Compare across epsilons:
+
+```{r}
+top_terms_all_eps %>%
+  select(epsilon, topic, rank, term) %>%
+  pivot_wider(names_from = epsilon, values_from = term)
+```
+
+create a stability table 
+
+```{r}
+topic_stability <- tibble(
+  topic = 1:20,
+  stability = c(
+    "Moderate", "Moderate", "Moderate", "Moderate",
+    "Moderate", "Moderate", "Stable", "Moderate",
+    "Stable", "Moderate", "Moderate", "Moderate",
+    "Moderate", "Collapsed", "Collapsed", "Collapsed",
+    "Collapsed", "Collapsed", "Collapsed", "Collapsed"
+  )
+)
+```
+
+now visualize
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Convert to factor with ordered levels
+topic_stability <- topic_stability %>%
+  mutate(stability = factor(stability,
+                            levels = c("Stable", "Moderate", "Collapsed")))
+
+ggplot(topic_stability, aes(x = factor(topic), fill = stability)) +
+  geom_bar() +
+  scale_fill_manual(values = c(
+    "Stable" = "#2E8B57",      # green
+    "Moderate" = "#FFD700",    # gold
+    "Collapsed" = "#B22222"    # red
+  )) +
+  labs(
+    title = "Topic Stability Under Differential Privacy Noise",
+    x = "Topic ID",
+    y = "Count",
+    fill = "Stability Level"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+Heatmap style visualization
+
+```{r}
+ggplot(topic_stability, aes(x = 1, y = factor(topic), fill = stability)) +
+  geom_tile(color = "white", height = 0.9) +
+  scale_fill_manual(values = c(
+    "Stable" = "#2E8B57",
+    "Moderate" = "#FFD700",
+    "Collapsed" = "#B22222"
+  )) +
+  labs(
+    title = "Topic Stability Heatmap: ε = 5 (less noise) vs ε = 0.05 (high noise)",
+    x = "",
+    y = "Topic",
+    fill = "Stability"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_blank(),
+    panel.grid = element_blank()
+  )
+```
+
+save as high res
+
+```{r}
+ggsave(
+  "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures/topic_stability.png",
+  width = 8, height = 6, dpi = 300
+)
+```
+
+now try with sensitivity = 80 based on our biggest outlier 
+
+```{r}
+compute_dp_coherence_s80 <- function(phi, dfm, eps, scale_factor = 100, sens = 80, seed = 1234) {
+  
+  set.seed(seed + round(eps * 1000))
+  
+  # Align dfm vocabulary 
+  vocab_lda <- colnames(phi)
+  dfm_aligned <- dfm[, vocab_lda]
+  dtm <- as(dfm_aligned, "dgCMatrix")
+
+  # Convert phi to pseudo-counts
+  phi_counts <- round(phi * scale_factor)
+
+  # Add Laplace noise with VERY LARGE sensitivity
+  b <- sens / eps
+  noise <- rlaplace(length(phi_counts), scale = b)
+  phi_noisy <- phi_counts + matrix(noise, nrow(phi), ncol(phi))
+  phi_noisy[phi_noisy < 0] <- 0
+
+  # Normalize
+  phi_dp <- phi_noisy / rowSums(phi_noisy)
+  colnames(phi_dp) <- vocab_lda
+
+  # Compute coherence
+  coh_before <- CalcProbCoherence(phi, dtm)
+  coh_after  <- CalcProbCoherence(phi_dp, dtm)
+
+  tibble(
+    topic = 1:nrow(phi),
+    coherence_before = coh_before,
+    coherence_after  = coh_after,
+    drop = coh_before - coh_after,
+    epsilon = eps,
+    sensitivity = sens
+  )
+}
+```
+
+specify epsilons and add noise
+
+```{r}
+eps_values_s80 <- c(8, 7, 6, 5, 3, 2, 1, 0.5, 0.1, 0.05)
+
+results_s80 <- lapply(eps_values_s80, function(eps) {
+  compute_dp_coherence_s80(phi, dfm_small, eps)
+})
+
+results_s80 <- bind_rows(results_s80)
+```
+
+plot the privacy-utility curve
+
+```{r}
+privacy_curve_s80 <- results_s80 %>%
+  group_by(epsilon) %>%
+  summarise(mean_drop = mean(drop)) %>%
+  ggplot(aes(x = epsilon, y = mean_drop)) +
+  geom_line(linewidth = 1.2, color = "red3") +
+  geom_point(size = 3, color = "red3") +
+  scale_x_reverse() +
+  labs(
+    title = "Privacy–Utility Curve (Sensitivity = 80)",
+    x = "Epsilon (lower = more noise)",
+    y = "Mean Coherence Drop"
+  ) +
+  theme_minimal()
+
+privacy_curve_s80
+```
+
+save the plot
+
+```{r}
+ggsave(
+  filename = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures/fig5_privacy_utility_curve_s80.png",
+  plot = privacy_curve_s80,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+For extremely small ε and large sensitivity (ε=0.05, sens=80), topic-word distributions collapse toward uniform or noise-dominated vectors. Topic coherence metrics are no longer meaningful in this regime and may show non-monotonic behavior due to numerical instability.
+

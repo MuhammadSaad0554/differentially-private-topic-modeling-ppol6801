@@ -1,0 +1,656 @@
+---
+title: "Exploratory Data Analysis & Privacy Risks in 20 Newsgroups"
+author: "Muhammad Saad"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+Import libraries and setup 
+
+```{r}
+library(tidyverse)
+library(reticulate)
+library(quanteda)
+
+project_dir <- "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project"
+fig_dir <- file.path(project_dir, "figures")
+data_dir <- file.path(project_dir, "data")
+
+dir.create(fig_dir, showWarnings = FALSE)
+dir.create(data_dir, showWarnings = FALSE)
+```
+
+Check 
+
+```{r}
+file.exists(fig_dir)
+file.exists(data_dir)
+```
+
+Install scikit learn
+
+```{r}
+reticulate::py_install("scikit-learn", envname = "/Users/muhammadsaad/Library/Caches/org.R-project.R/R/reticulate/uv/cache/archive-v0/AYac_A4lhhLFAHEKeJAGY")
+```
+
+Import datasets from scikit learn
+
+```{r}
+sk <- import("sklearn.datasets")
+tuple <- reticulate::tuple 
+```
+
+Fetch newsgroup data. Include all headers to see metadata as well. 
+
+```{r}
+ng_full <- sk$fetch_20newsgroups(
+  subset = "all",
+  remove = tuple()   # keep everything
+)
+```
+
+View raw data
+
+```{r}
+# Build dataframe 
+df_raw <- tibble(
+  text  = unlist(ng_full$data),
+  group = ng_full$target_names[as.integer(ng_full$target) + 1]
+)
+
+#  metadata fields 
+df_raw <- df_raw %>%
+  mutate(
+    subject = stringr::str_extract(text, "(?<=Subject: ).*"),
+    from    = stringr::str_extract(text, "(?<=From: ).*"),
+    email   = stringr::str_extract(
+      text,
+      "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    )
+  )
+
+# Save dataset
+saveRDS(df_raw, file.path(data_dir, "20news_raw.rds"))
+
+glimpse(df_raw)
+```
+Notice that the metadata includes emails as well. 
+
+The newsgroup data is more than 30 years old (early 1990–1994). Widely used in ML research and is publicly hosted (e.g., UC Irvine ML Repository).
+
+Also, many emails and hosts no longer exist. The identifiers are apparently mostly obsolete.
+
+Are there are multiple posts by similar people?
+
+```{r}
+library(stringr)
+library(dplyr)
+
+df_ids <- df_raw %>%
+  mutate(
+    email = str_extract(
+      text,
+      "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    )
+  )
+```
+
+Count
+
+```{r}
+email_counts <- df_ids %>%
+  filter(!is.na(email)) %>%
+  count(email, sort = TRUE)
+```
+
+View
+
+```{r}
+email_counts %>% filter(n > 1) %>% head(20)
+```
+
+Develop some initial visualizations
+
+```{r}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+
+df_ids <- df_raw %>%
+  mutate(
+    email = str_extract(
+      text,
+      "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    )
+  )
+
+email_counts <- df_ids %>%
+  filter(!is.na(email)) %>%
+  count(email, sort = TRUE)
+```
+
+Top 20 Repeat Posters
+
+```{r}
+p1 <- email_counts %>%
+  slice(1:20) %>%
+  ggplot(aes(x = reorder(email, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Most Active Posters",
+    x = "Email",
+    y = "Number of Posts"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 6)  
+  )
+```
+
+Long tail distribution of posts per people
+
+```{r}
+p2 <- email_counts %>%
+  ggplot(aes(n)) +
+  geom_histogram(bins = 40, fill = "darkgreen") +
+  scale_x_log10() +
+  labs(
+    title = "Distribution Posts per User",
+    x = "Number of Posts",
+    y = "Count of Users"
+  ) +
+  theme_minimal()
+```
+
+Summary metrics
+
+```{r}
+summary_df <- tibble(
+  total_docs = nrow(df_raw),
+  users_with_emails = nrow(email_counts),
+  max_posts_by_user = max(email_counts$n),
+  median_posts = median(email_counts$n)
+)
+
+p3 <- ggplot(summary_df) +
+  geom_text(
+    aes(
+      x = 0, y = 0,
+      label = paste(
+        "Total Documents: ", total_docs, "\n",
+        "Users with Identifiable Emails: ", users_with_emails, "\n",
+        "Max Posts by One User: ", max_posts_by_user, "\n",
+        "Median Posts per User: ", median_posts, sep = ""
+      )
+    ),
+    size = 5
+  ) +
+  theme_void() +
+  labs(title = "Dataset Summary")
+```
+
+Combine into a panel 
+
+```{r}
+panel <- (p1 | p2) / p3
+```
+
+Save 
+
+```{r}
+ggsave(
+  filename = "AnnexA_frequentposters_metadata.png",
+  plot = panel,
+  path = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures",
+  width = 12,     
+  height = 10,    
+  dpi = 300
+)
+```
+
+Focus on two of the top 20 posters: **sera@zuma.UUCP", "henry@zoo.toronto.edu**
+
+```{r}
+targets <- c("sera@zuma.UUCP", "henry@zoo.toronto.edu")
+
+df_two <- df_ids %>%
+  filter(email %in% targets)
+```
+
+See which newsgroups they mostly post to
+
+```{r}
+p_groups <- df_two %>%
+  count(email, group) %>%
+  ggplot(aes(x = reorder(group, n), y = n, fill = email)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Posting Distribution by Newsgroup",
+    x = "Newsgroup",
+    y = "Number of Posts",
+    fill = "Poster"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y  = element_text(size = 14),   
+    legend.text  = element_text(size = 14),   
+    legend.title = element_text(size = 14)    
+  )
+```
+
+save figure
+
+```{r}
+ggsave(
+  filename = "posting_distribution_highres.png",
+  plot = p_groups,
+  path = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures",
+  width = 12,
+  height = 10,
+  dpi = 600
+)
+```
+
+Extract some sample posts by these two users
+
+```{r}
+sample_posts <- df_two %>%
+  group_by(email) %>%
+  slice_head(n = 2) %>%
+  mutate(
+    short_text = stringr::str_trunc(text, 500)  
+  ) %>%
+  select(email, group, short_text)
+sample_posts
+```
+
+One privacy protection that is frequently put into place is **pseudonymization**. This means that we remove any personally identifiable information from the data. 
+
+In this case, I will remove all metadata and also remove email IDs/identifiers that are present in posts' text. I will only retain the newsgroup name and the post text. For illustrative purposes I will assign each identifiable unique ID, which will also be one of my column. 
+
+extract emails again 
+
+```{r}
+df_ids <- df_raw %>%
+  mutate(
+    email = stringr::str_extract(
+      text,
+      "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"
+    )
+  )
+```
+
+assign each unique email a user ID 
+
+```{r}
+email_map <- df_ids %>%
+  distinct(email) %>%
+  filter(!is.na(email)) %>%
+  mutate(user_id = paste0("user_", row_number()))
+```
+
+Join user ID back to the dataset 
+
+```{r}
+df_pseudo <- df_ids %>%
+  left_join(email_map, by = "email")
+```
+
+Remove all identifiable information from the posts' text
+
+developed using ChatGPT
+
+```{r}
+df_pseudo <- df_pseudo %>%
+  mutate(
+    clean_text = text %>%
+      # remove full email addresses
+      str_replace_all("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "") %>%
+      # remove message IDs like <1993Apr19.234534.18368@kpc.com>
+      str_replace_all("<[^>]*>", "") %>%
+      # remove header fields entirely
+      str_replace_all("(?m)^From:.*$", "") %>%
+      str_replace_all("(?m)^Reply-To:.*$", "") %>%
+      str_replace_all("(?m)^Subject:.*$", "") %>%
+      str_replace_all("(?m)^Organization:.*$", "") %>%
+      str_replace_all("(?m)^Distribution:.*$", "") %>%
+      str_replace_all("(?m)^Lines:.*$", "") %>%
+      # remove leading ">" quotes that often contain identifiers
+      str_replace_all("(?m)^>.*$", "") %>%
+      # trim extra whitespace
+      stringr::str_squish()
+  )
+```
+
+Retain only three features: user_id, group and clean_text
+
+```{r}
+df_final <- df_pseudo %>%
+  select(user_id, group, clean_text)
+```
+
+Save the pseudonymized dataset with restricted features
+
+```{r}
+saveRDS(
+  df_final,
+  "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/data/20news_pseudonymized.rds"
+)
+```
+
+Now implement three tests which show privacy risks even though the dataset have been pseudonymized. 
+
+These are: 
+
+1. Stylometric Fingerting Risk 
+Done by: Narayanan, A., & Shmatikov, V. (2008). Robust de-anonymization of large sparse datasets. IEEE Symposium on Security and Privacy, 111–125. 
+
+2. Rare Vocabulary Risk 
+Done by: Sánchez, D., Martínez, S., & Domingo-Ferrer, J. (2012). A survey of data privacy techniques based on k-anonymity and privacy-preserving data publishing. ACM Computing Surveys, 44(4), 1–33.
+
+3. Sensitive Topic Leakage 
+Done by: Carlini, N., Tramer, F., Wallace, E., Jagielski, M., Herbert-Voss, A., Lee, K., ... & Song, D. (2022). Extracting training data from large language models. USENIX Security Symposium.
+
+
+Check **Stylometric Fingerting Risk** 
+
+Load pseudonymized dataset
+
+```{r}
+df_final <- readRDS(
+  "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/data/20news_pseudonymized.rds"
+)
+```
+
+run diagnostics
+
+```{r}
+# number of unique posters
+length(unique(df_final$user_id))
+
+# number of documents
+nrow(df_final)
+
+# average document length (optional)
+summary(nchar(df_final$clean_text))
+```
+sample 50 users randomly
+
+```{r}
+set.seed(123)
+
+sample_users <- sample(unique(df_final$user_id), 50)
+
+df_small <- df_final %>% 
+  filter(user_id %in% sample_users)
+```
+
+build corpus and tokens
+
+```{r}
+library(quanteda.textstats)
+
+corp <- corpus(df_small, text_field = "clean_text")
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_numbers = TRUE
+)
+```
+
+Stylometric features per document
+
+```{r}
+df_features <- tibble(
+  doc_id = docnames(corp),
+  user_id = df_small$user_id,
+  text = df_small$clean_text
+) %>%
+  mutate(
+    n_chars      = nchar(text),
+    n_tokens     = ntoken(tokens(text)),
+    avg_word_len = n_chars / n_tokens,
+    ttr          = textstat_lexdiv(tokens(text), "TTR")$TTR
+  )
+```
+
+function word frequencies
+
+```{r}
+fwords <- stopwords("en")
+
+dfm_fw <- dfm(tokens(df_small$clean_text), tolower = TRUE) %>%
+  dfm_keep(fwords) %>%
+  dfm_weight(scheme = "prop")
+
+fw_df <- convert(dfm_fw, to = "data.frame") %>%
+  as_tibble() %>%
+  rename(doc_id = doc_id)
+```
+
+merge features
+
+```{r}
+stylometric <- df_features %>%
+  left_join(fw_df, by = "doc_id") %>%
+  select(-text)
+```
+
+construct user level vectors
+
+```{r}
+user_vectors <- stylometric %>%
+  select(-doc_id) %>%
+  group_by(user_id) %>%
+  summarise(across(everything(), \(x) mean(x, na.rm = TRUE)))
+```
+
+PCA 
+
+```{r}
+# Build matrix from user vectors
+mat <- as.matrix(user_vectors %>% select(-user_id))
+
+# Replace NA, Inf, -Inf with 0
+mat[!is.finite(mat)] <- 0
+
+# Drop zero-variance columns 
+nzv_cols <- apply(mat, 2, var) > 0
+mat_clean <- mat[, nzv_cols, drop = FALSE]
+
+# Drop users whose stylometric vector is zero
+nonzero_users <- rowSums(mat_clean) > 0
+mat_clean <- mat_clean[nonzero_users, , drop = FALSE]
+
+user_ids_clean <- user_vectors$user_id[nonzero_users]
+rownames(mat_clean) <- user_ids_clean
+
+# PCA 
+pca <- prcomp(mat_clean, scale. = TRUE)
+
+pca_df <- as_tibble(pca$x) %>%
+  mutate(user_id = rownames(pca$x))
+```
+
+Plot
+
+```{r}
+library(ggplot2)
+
+ggplot(pca_df, aes(PC1, PC2, label = user_id)) +
+  geom_point(color = "darkred", size = 3, alpha = 0.7) +
+  geom_text(size = 2, vjust = -0.6) +
+  theme_minimal() +
+  labs(
+    title = "Stylometric Fingerprinting After Pseudonymization",
+    subtitle = "Users cluster by writing style even after removing identifiers",
+    x = "PC1",
+    y = "PC2"
+  )
+```
+
+save plot 
+
+```{r}
+ggsave(
+  filename = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures/fig1_pca_stylometry.png",
+  plot = last_plot(),
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+Now run the **Rare Vocabulary Risk**
+
+Look at terms frequency across all documents
+
+```{r}
+library(quanteda)
+
+corp_rv <- corpus(df_final$clean_text)
+toks_rv <- tokens(corp_rv, remove_punct = TRUE, remove_numbers = TRUE)
+
+dfm_rv <- dfm(toks_rv)
+
+# term frequency across all documents
+term_freq <- colSums(dfm_rv)
+```
+
+look for rare terms
+
+```{r}
+# rare terms: appear in only 1 or 2 documents
+rare_terms <- names(term_freq[term_freq <= 2])
+
+length(rare_terms)  # how many rare terms exist
+```
+
+check how many documents contain at least one rare term
+
+```{r}
+docs_with_rare <- dfm_rv[, rare_terms]
+rare_doc_counts <- rowSums(docs_with_rare > 0)
+```
+
+now check for number of documents uniquely identifiable by a rare term
+
+```{r}
+unique_docs <- sum(rare_doc_counts == 1)
+unique_docs
+```
+
+Now simulate a membership inference attack
+
+Load pseudonymized dataset again - afraid that R may crash again, so good checkpoint to have here 
+
+```{r}
+df <- df_final
+
+set.seed(1)
+df <- df %>% sample_n(9000) 
+```
+
+Create a train and shadow split (50/50)
+
+```{r}
+set.seed(1)
+train_idx <- sample(1:nrow(df), nrow(df)/2)
+
+df_train <- df[train_idx, ]
+df_test  <- df[-train_idx, ]
+
+df_train$member <- 1   # in training
+df_test$member  <- 0   # not in training
+```
+
+Build a dfm and train a simple classifier
+
+```{r}
+# Build corpus from the pseudonymized dataset
+corp <- corpus(df, text_field = "clean_text")
+
+# Tokenize (basic cleaning)
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_numbers = TRUE
+)
+
+# Build document-feature matrix
+dfm_all <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 5)   
+
+# Split dfm into training and test partitions
+dfm_train <- dfm_all[train_idx, ]
+dfm_test  <- dfm_all[-train_idx, ]
+```
+
+Train Naive Bayes as a classifier
+
+```{r}
+# Train Naive Bayes classifier on the TRAIN dfm
+cls <- textmodel_nb(dfm_train, df_train$group)
+
+# Predict probability distributions for TRAIN and TEST sets
+train_probs <- predict(cls, dfm_train, type = "prob")
+test_probs  <- predict(cls, dfm_test,  type = "prob")
+
+# Extract the model's highest confidence score for each document
+df_train$conf <- apply(train_probs, 1, max)
+df_test$conf  <- apply(test_probs,  1, max)
+
+# Combine them for MIA attacker model
+mia_data <- bind_rows(df_train, df_test) %>%
+  select(conf, member)
+```
+
+Train membership inference attack
+
+```{r}
+mia_attack <- glm(member ~ conf, data = mia_data, family = binomial)
+summary(mia_attack)
+```
+
+Predicted membership
+
+```{r}
+mia_data$pred_member <- ifelse(
+  predict(mia_attack, type = "response") > 0.5,
+  1, 0
+)
+```
+
+Accuracy
+
+```{r}
+mean(mia_data$pred_member == mia_data$member)
+```
+
+ROC/AUC
+
+```{r}
+library(pROC)
+auc(mia_data$member, mia_data$conf)
+```
+
+Visualize membership leakge
+
+```{r}
+library(ggplot2)
+
+ggplot(mia_data, aes(x = conf, fill = factor(member))) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Membership Inference Attack — Confidence Leakage",
+    x = "Model Confidence",
+    fill = "Member (1=train, 0=test)"
+  ) +
+  theme_minimal()
+```

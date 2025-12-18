@@ -1,0 +1,660 @@
+---
+title: "LDA Topic Modeling & Privacy Risks"
+author: "Muhammad Saad"
+format:
+  html:
+    toc: true
+    toc_float: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+Load required packages
+
+```{r}
+library(tidyverse)
+library(quanteda)
+library(quanteda.textmodels)
+library(quanteda.textstats)
+library(tidytext)
+library(topicmodels)
+```
+
+Set dataset path 
+
+```{r}
+data_path <- "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/data/20news_pseudonymized.rds"
+```
+
+Load data
+
+```{r}
+df <- readRDS(data_path)
+```
+
+add row number 
+
+```{r}
+df <- df %>%
+  mutate(doc_id = row_number())
+```
+
+check data
+
+```{r}
+glimpse(df)
+```
+
+build corpus from pseudonymized dataset
+
+```{r}
+corp <- corpus(df, text_field = "clean_text", docid_field = "doc_id")
+corp
+```
+
+Do tokenization
+
+```{r}
+# Tokenize and clean
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE
+) |> 
+  tokens_tolower() |>
+  tokens_remove(stopwords("en")) |>
+  tokens_wordstem()
+
+toks
+```
+
+In the tokens we can still see some identifiers such as email IDs and re-examine
+
+```{r}
+toks <- toks |>
+  tokens_remove(pattern = c("\\b[\\w.-]+\\.(edu|com|org|net|gov)\\b", 
+                            "nntp-posting-host",
+                            "posting-host",
+                            "host",
+                            "article",
+                            "writes",
+                            "organization"),
+                valuetype = "regex")
+toks
+```
+
+build DFM
+
+```{r}
+dfm_raw <- dfm(toks)
+dfm_raw
+```
+
+remove extremely rare and extremely common terms
+
+```{r}
+dfm_trimmed <- dfm_trim(
+  dfm_raw,
+  min_termfreq = 5,          # remove words appearing <5 times
+  max_docfreq = 0.5,         # remove words appearing in >50% of documents
+  docfreq_type = "prop"
+)
+
+dfm_trimmed
+```
+
+remove empty documents
+
+```{r}
+# Identify empty docs
+empty_docs <- rowSums(dfm_trimmed) == 0
+
+# Keep only non-empty docs in DFM
+dfm_final <- dfm_trimmed[!empty_docs, ]
+
+# Keep metadata aligned (this uses df, which you have)
+df_final2 <- df[!empty_docs, ]
+```
+
+check dimensions of dfm
+
+```{r}
+dim(dfm_final)
+```
+
+trimming for LDA (document frequency-based)
+
+```{r}
+n_docs <- ndoc(dfm_final)
+
+dfm_small <- dfm_trim(
+  dfm_final,
+  min_docfreq = 30 / n_docs,   # term must appear in >= 30 docs
+  max_docfreq = 0.5,           # term appears in <= 50% docs
+  docfreq_type = "prop"
+)
+
+dfm_small
+dim(dfm_small)
+```
+
+check memory for the updated dataframe
+
+```{r}
+library(lobstr)
+lobstr::obj_size(dfm_small)
+```
+
+Since we have **20** newsgroups, set k as 20 for LDA topic-modelling
+
+```{r}
+library(topicmodels)
+
+lda_model <- LDA(
+  convert(dfm_small, to = "topicmodels"),
+  k = 20,
+  method = "Gibbs",
+  control = list(
+    seed   = 123,
+    iter   = 1500,
+    burnin = 500,
+    thin   = 100
+  )
+)
+```
+
+Correct γ-to-metadata alignment block 
+
+```{r}
+# Extract gamma from LDA
+gamma <- tidy(lda_model, matrix = "gamma")
+
+# Convert LDA's document index into doc_id
+gamma <- gamma %>%
+  mutate(doc_id = as.integer(document))
+
+# Bring in metadata
+meta_aligned <- gamma %>%
+  left_join(df_final2 %>% select(doc_id, user_id, group), by = "doc_id")
+
+# Check
+head(meta_aligned)
+```
+
+identify top poster for topi 3 related to Middle Eastern Politics 
+
+```{r}
+# Identify docs with highest probability for Topic 3
+topic3_docs <- meta_aligned %>%
+  filter(topic == 3) %>%
+  arrange(desc(gamma))
+
+# Get top 50 docs for topic 3
+top50_topic3 <- topic3_docs %>% slice(1:50)
+
+# Count which user dominates Topic 3
+top_poster_topic3 <- top50_topic3 %>%
+  count(user_id, sort = TRUE)
+
+top_poster_topic3
+```
+
+now filter out all documents from user_92 who is the most frequent poster for Topic 3 
+
+```{r}
+df_removed <- df_final2 %>%
+  filter(user_id != "user_92") %>%
+  mutate(doc_id = row_number())
+```
+
+rebuild corpus, tokens and trimming
+
+```{r}
+corp_removed <- corpus(df_removed, text_field = "clean_text")
+
+toks_removed <- tokens(
+  corp_removed,
+  remove_punct = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE
+) |>
+  tokens_tolower() |>
+  tokens_remove(stopwords("en")) |>
+  tokens_wordstem() |>
+  tokens_remove(pattern = c("\\b[\\w.-]+\\.(edu|com|org|net|gov)\\b",
+                            "nntp-posting-host",
+                            "posting-host",
+                            "host",
+                            "article",
+                            "writes",
+                            "organization"),
+                valuetype = "regex")
+
+dfm_removed_raw <- dfm(toks_removed)
+
+dfm_removed_trimmed <- dfm_trim(
+  dfm_removed_raw,
+  min_termfreq = 5,
+  max_docfreq = 0.5,
+  docfreq_type = "prop"
+)
+
+empty_removed <- rowSums(dfm_removed_trimmed) == 0
+
+dfm_removed_final <- dfm_removed_trimmed[!empty_removed, ]
+df_removed_final2 <- df_removed[!empty_removed, ]
+```
+
+rebuild dfm_small for LDA
+
+```{r}
+n_docs_removed <- ndoc(dfm_removed_final)
+
+dfm_removed_small <- dfm_trim(
+  dfm_removed_final,
+  min_docfreq = 30 / n_docs_removed,
+  max_docfreq = 0.5,
+  docfreq_type = "prop"
+)
+```
+
+run LDA again with posts from user_92 removed
+
+```{r}
+lda_removed <- LDA(
+  convert(dfm_removed_small, to = "topicmodels"),
+  k = 20,
+  method = "Gibbs",
+  control = list(
+    seed = 123,
+    iter = 1500,
+    burnin = 500,
+    thin = 100
+  )
+)
+```
+
+extract Topic 3 terms before and after removal of posts by user_92
+
+```{r}
+#  Baseline Topic 3 
+beta_base <- tidy(lda_model, matrix = "beta") %>%
+  filter(topic == 3) %>%
+  arrange(desc(beta)) %>%
+  slice(1:15) %>%
+  mutate(rank_base = row_number(),
+         term_base = term,
+         beta_base = beta) %>%
+  select(rank_base, term_base, beta_base)
+
+# Topic 3 After Removing Top Poster 
+beta_removed <- tidy(lda_removed, matrix = "beta") %>%
+  filter(topic == 3) %>%
+  arrange(desc(beta)) %>%
+  slice(1:15) %>%
+  mutate(rank_removed = row_number(),
+         term_removed = term,
+         beta_removed = beta) %>%
+  select(rank_removed, term_removed, beta_removed)
+
+# Combine for comparison table
+topic3_compare <- bind_cols(beta_base, beta_removed)
+topic3_compare
+```
+
+extract top words for both LDAs across 20 topics
+
+```{r}
+baseline_terms <- terms(lda_model, 15)   # top 15 words
+
+cat("\n BASELINE MODEL TOPICS\n")
+for (i in 1:20) {
+  cat("\nTopic", i, ":\n")
+  cat(paste(baseline_terms[, i], collapse = ", "), "\n")
+}
+```
+
+after removal
+
+```{r}
+removed_terms <- terms(lda_removed, 15)   # top 15 words
+
+cat("\nREMOVED-USER MODEL TOPICS\n")
+for (i in 1:20) {
+  cat("\nTopic", i, ":\n")
+  cat(paste(removed_terms[, i], collapse = ", "), "\n")
+}
+```
+
+compare topic 3 with user_92 data with topic 7 for without user_92 data
+
+```{r}
+baseline_topic <- 3
+removed_topic  <- 7
+
+top_base <- beta_tidy %>%
+  filter(topic == baseline_topic) %>%
+  slice_max(beta, n = 15) %>%
+  mutate(model = "baseline")
+
+top_removed <- tidy(lda_removed, matrix = "beta") %>%
+  filter(topic == removed_topic) %>%
+  slice_max(beta, n = 15) %>%
+  mutate(model = "removed")
+
+comparison_df <- full_join(
+  top_base %>% select(term, beta, model),
+  top_removed %>% select(term, beta, model),
+  by = "term",
+  suffix = c("_base", "_removed")
+)
+
+comparison_df <- comparison_df %>%
+  replace_na(list(beta_base = 0, beta_removed = 0))
+```
+
+extract top 10 terms for topic 3 baseline vs topic 7 updated
+
+```{r}
+# Baseline Topic 3
+top_base <- beta_tidy %>%
+  filter(topic == 3) %>%
+  slice_max(beta, n = 10) %>%
+  mutate(model = "Baseline Topic 3")
+
+# Removed-model Topic 7
+beta_removed_tidy <- tidy(lda_removed, matrix = "beta")
+
+top_removed <- beta_removed_tidy %>%
+  filter(topic == 7) %>%
+  slice_max(beta, n = 10) %>%
+  mutate(model = "Removed Topic 7")
+
+# Combine
+viz_df <- bind_rows(top_base, top_removed)
+```
+
+visualize
+
+```{r}
+p <- ggplot(
+  viz_df,
+  aes(x = reorder_within(term, beta, model), y = beta, fill = model)
+) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ model, scales = "free_y", ncol = 2) +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(
+    title = "Top 10 Words for Baseline LDA vs. Updated LDA with User_92 Removed",
+    x = NULL,
+    y = "β-Probability"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+save the image
+
+```{r}
+ggsave(
+  filename = "fig3_topic3_vs_topic7_comparison.png",
+  plot = p,
+  path = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures",
+  dpi = 600,
+  width = 12,
+  height = 8,
+  units = "in"
+)
+```
+
+
+now do a **Rare Word Memorization Plot**
+
+compute document frequency per terms
+
+```{r}
+df_counts <- data.frame(
+  term = featnames(dfm_small),
+  df = docfreq(dfm_small)
+)
+```
+
+extract B for one topic (i.e. Topic 3)
+
+```{r}
+topic3_beta <- beta_tidy %>%
+  filter(topic == 3)
+```
+
+merge
+
+```{r}
+merged <- topic3_beta %>%
+  left_join(df_counts, by = "term")
+```
+
+mark top 10 words
+
+```{r}
+top10 <- merged %>% slice_max(beta, n = 10) %>% pull(term)
+
+merged <- merged %>%
+  mutate(highlight = term %in% top10)
+```
+
+compute document frequency before any trimming
+
+```{r}
+df_raw <- df %>% select(clean_text)  # original data
+
+toks_raw <- tokens(
+  df$clean_text,
+  remove_punct = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE
+) |>
+  tokens_tolower()
+
+df_raw_freq <- textstat_frequency(dfm(toks_raw)) %>%
+  select(feature, frequency)
+
+```
+
+join with existing beta tidy
+
+```{r}
+merged <- beta_tidy %>%
+  left_join(df_raw_freq, by = c("term" = "feature")) %>%
+  mutate(
+    df = ifelse(is.na(frequency), 0, frequency),
+    df = ifelse(df == 0, 1, df),     # log scale fix
+    rare = df < 5
+  )
+```
+
+create another merged dataframe
+
+```{r}
+merged <- merged %>%
+  mutate(
+    rare_label = ifelse(rare, "Rare (<5 docs)", "Not Rare")
+  )
+```
+
+develop scatter plot
+
+```{r}
+library(ggrepel)
+
+p2 <- ggplot(merged, aes(x = df, y = beta, color = rare_label)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  scale_x_log10() +
+  geom_text_repel(
+    data = merged %>% filter(rare == TRUE & beta > quantile(beta, 0.99)),
+    aes(label = term),
+    size = 3,
+    max.overlaps = 10
+  ) +
+  labs(
+    title = "Memorization Risk: Rare Words With High Topic Probabilities",
+    subtitle = "Rare terms (blue) appearing in <5 documents but assigned high β",
+    x = "Document Frequency (log10 scale)",
+    y = "β Probability",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5)
+  )
+```
+
+Most low-frequency words (red points) receive low β values, as expected.
+
+However, the term “articl”, which appears in fewer than 5 documents—receives a disproportionately high topic probability. This indicates that the model has effectively memorized this rare input token and elevated it in the topic-word distribution.
+
+From a privacy perspective, this is problematic: an attacker who only sees the model outputs (and not the training data) can still infer that this rare term exists in the corpus and is strongly tied to a particular topic.
+
+This visualization illustrates why LDA is not privacy-preserving by default and motivates the need for DP-LDA mechanisms.
+
+
+save plot 
+
+```{r}
+ggsave(
+  filename = "lda_memorization_risk.png",
+  plot = p2,
+  path = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures",
+  dpi = 600,         
+  width = 10,        
+  height = 6,
+  units = "in"
+)
+```
+
+check 
+
+```{r}
+terms(lda_model, 10)
+```
+
+extract beta in tidy
+
+```{r}
+beta_tidy <- tidy(lda_model, matrix = "beta")
+```
+
+see the top terms per topics
+
+```{r}
+top_terms_for_labeling <- beta_tidy %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 12) %>%   
+  ungroup() %>%
+  arrange(topic, desc(beta))
+
+topic_groups <- top_terms_for_labeling %>%
+  group_by(topic) %>%
+  summarise(terms = paste(term, collapse = ", ")) %>%
+  ungroup()
+
+topic_groups
+```
+
+extract top words all 20 topics 
+
+```{r}
+topic_terms <- terms(lda_model, 15) # top 15 words
+
+for (i in 1:20) {
+  cat("\nTopic", i, "\n")
+  cat(paste(topic_terms[, i], collapse = ", "), "\n")
+}
+```
+
+Choose 10 relevant groups from the 20 newsgroup data
+
+```{r}
+topic_labels_10 <- tibble(
+  topic = c(2, 3, 5, 6, 7, 12, 13, 14, 15, 20),
+  label = c(
+    "Christian Religion",
+    "Middle East Politics",
+    "Autos / Motorcycles",
+    "Space / NASA",
+    "Computer Graphics",
+    "Windows / Hardware",
+    "Medicine / Health",
+    "Help / Requests / Pricing",
+    "Hockey",
+    "X Windows / Programming"
+  )
+)
+```
+
+extract top 10 terms
+
+```{r}
+top_terms_10 <- beta_tidy %>%
+  filter(topic %in% topic_labels_10$topic) %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  left_join(topic_labels_10, by = "topic")
+top_terms_10
+```
+
+visualize
+
+```{r}
+library(stringr)
+
+ggplot(
+  top_terms_10,
+  aes(x = reorder_within(term, beta, label), y = beta, fill = label)
+) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(
+    ~ label,
+    scales = "free_y",
+    ncol = 5,
+    labeller = label_wrap_gen(width = 18)
+  ) +
+  scale_x_reordered(guide = guide_axis(check.overlap = TRUE)) +   
+  scale_y_continuous(labels = NULL) +
+  coord_flip() +
+  labs(
+    title = "Top terms per LDA topic clearly map onto the original 20 Newsgroup categories",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+    strip.text = element_text(size = 9, face = "bold"),
+    axis.text.y = element_text(size = 8),     # smaller labels 
+    panel.spacing = unit(0.8, "lines")
+  )
+```
+
+save the plot
+
+```{r}
+ggsave(
+  filename = "fig2_lda_top_terms_10topics.png",
+  path = "/Users/muhammadsaad/Desktop/Georgetown/Semester_3/Text as Data/Final Project/figures",
+  dpi = 600,                 # high resolution
+  width = 12,                # adjust depending on layout
+  height = 8,
+  units = "in"
+)
+```
+
