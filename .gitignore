@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# R Markdown / Quarto
+*_cache/
+*_files/
+
+# Large generated objects
+*.RData
+
+# Temporary files
+tmp/
+
